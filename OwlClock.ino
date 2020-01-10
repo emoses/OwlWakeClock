@@ -1,4 +1,5 @@
 #include "secrets.h"
+#include "types.h"
 #include <WiFi.h>
 #include "time.h"
 #include <ESPmDNS.h>
@@ -6,16 +7,14 @@
 #include <WebServer.h>
 #include <Preferences.h>
 
-time_t this_second = 0;
-time_t last_second = 0;
 
 const char* MDNS_NAME = "owlclock";
 
-#define BUTTON_PIN 34
+#define BUTTON_PIN 23
 
-#define RED_PIN 27
-#define GREEN_PIN 26
-#define BLUE_PIN 25
+#define RED_PIN 5
+#define GREEN_PIN 18
+#define BLUE_PIN 19
 #define RED_CHANNEL 0
 #define GREEN_CHANNEL 1
 #define BLUE_CHANNEL 2
@@ -29,36 +28,6 @@ const char* MDNS_NAME = "owlclock";
 const char* TZ_STR = "PST+8PDT,M3.2.0,M11.1.0";
 
 WebServer server(80);
-
-struct WakeTime_t {
-    time_t warn;
-    time_t OK;
-};
-
-struct RGB {
-    uint8_t R;
-    uint8_t G;
-    uint8_t B;
-};
-
-typedef enum {
-    OFF,
-    NAP,
-    SLEEP
-} Mode_t;
-
-typedef struct {
-    //How long a nap is, in minutes
-    uint16_t napLength;
-    //If it's before this time of day, it's a nap
-    uint16_t napsBeforeTime;
-    //This time of day is when we go from sleep to warn
-    uint16_t sleepWarnTime;
-    //This time of day is when we go from warn to OK
-    uint16_t sleepOKTime;
-    //Brightness
-    uint8_t brightness;
-} settings_t  __attribute__ ((packed));
 
 uint16_t minuteOfDay(int hour, int minute) {
     return hour * 60 + minute;
@@ -75,12 +44,12 @@ String minuteToTimeStr(uint16_t minuteOfDay) {
 }
 
 bool isBefore(uint16_t minuteOfDay, struct tm* timeinfo) {
-    uint16_t minute = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+    uint16_t minute = timeinfo->tm_hour * 60 + timeinfo->tm_min;
     return minuteOfDay < minute;
 }
 
 bool isAfter(uint16_t minuteOfDay, struct tm* timeinfo) {
-    uint16_t minute = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+    uint16_t minute = timeinfo->tm_hour * 60 + timeinfo->tm_min;
     return minuteOfDay > minute;
 }
 
@@ -98,8 +67,12 @@ const RGB SLEEP_COLOR = {30, 0, 0};
 const RGB WARN_COLOR = {30, 30, 0};
 const RGB OK_COLOR = {0, 30, 0};
 
+const int AUTO_OFF_TIME_SECONDS = 60 * 60;
+
 //Globals
-WakeTime_t wakeTime = {0, 0};
+time_t sleepStart = 0;
+long pulseStart = 0;
+RGB pulseColor;
 settings_t settings = DEFAULT_SETTINGS;
 Mode_t mode = OFF;
 Preferences preferences;
@@ -129,6 +102,7 @@ void setupLedPins() {
     pinMode(BLUE_PIN, OUTPUT);
     pinMode(RED_PIN, OUTPUT);
     pinMode(GREEN_PIN, OUTPUT);
+    pinMode(BUTTON_PIN, INPUT_PULLDOWN);
     ledcSetup(RED_CHANNEL, LEDC_BASE_FREQ, LEDC_RESOLUTION);
     ledcAttachPin(RED_PIN, RED_CHANNEL);
     ledcSetup(GREEN_CHANNEL, LEDC_BASE_FREQ, LEDC_RESOLUTION);
@@ -163,6 +137,37 @@ void loadSettings() {
     }
 }
 
+String modeToString(enum Mode_t mode) {
+    switch (mode) {
+        case OFF:
+            return "Off";
+        case NAP:
+            return "Nap";
+        case SLEEP:
+            return "Sleep";
+        default:
+            return "Unknown!?";
+    }
+}
+
+String colorToString(const RGB& color) {
+    if (color == OFF_COLOR) {
+        return "Off";
+    } else if (color == SLEEP_COLOR) {
+        return "Sleepy Red";
+    } else if (color == WARN_COLOR) {
+        return "Getting up yellow";
+    } else if (color == OK_COLOR) {
+        return "Fine to wake green";
+    } else {
+        char colorStr[20];
+        sprintf(colorStr, "(%d, %d, %d)", color.R, color.G, color.B);
+        return String(colorStr);
+    }
+}
+
+
+
 void setup() {
     Serial.begin(115200);
     delay(10);
@@ -173,6 +178,7 @@ void setup() {
 
     wifiConnect();
     configTzTime(TZ_STR, "pool.ntp.org");
+    time_t this_second = 0;
     while(!this_second) {
         time(&this_second);
         Serial.print("-");
@@ -204,6 +210,8 @@ void setup() {
             time = String(asctime(&timeinfo));
             String content = "<html><head><title>Hoo!</title></head>";
             content += "<body><h1>Hoo!</h1><p>It's currently " + time + "</p>";
+            content += "<h2>Mode: " + String(modeToString(mode)) + "</h2>";
+            content += "<p>Current color: " + colorToString(currentColor()) + "</p>";
             content += "<h2>Settings</h2><div>Nap length: " + String(settings.napLength) + " minutes<br/>";
             content += "It's a nap if it starts before " + minuteToTimeStr(settings.napsBeforeTime) + "<br/>";
             content += "It's warning if it's after " + minuteToTimeStr(settings.sleepWarnTime) + "<br/>";
@@ -215,62 +223,145 @@ void setup() {
             server.send(200, "text/html", content);
         });
     server.on("/start", HTTP_POST, [&]() {
-            time_t now;
-            time(&now);
-            wakeTime.warn = now + 60;
-            wakeTime.OK = wakeTime.warn + 60;
-            String content = "<html<head><title>Timer set</title></head>";
-            content += "<body><h1>OK!</h1><p>Timer set!</p><p>Warn time: ";
-            content += ctime(&wakeTime.warn);
-            content += "<br/>Wake time: ";
-            content += ctime(&wakeTime.OK);
-            content += "</p></body></html>";
+            startSleep();
+            String content = "<html><head><title>Timer set</title></head>";
+            content += "<body><h1>OK!</h1><p>Timer set!</p><a href=\"/\">Back</a>";
+            content += "</body></html>";
             server.send(200, "text/html", content);
         });
 
 }
 
-void setColor(uint8_t val, uint8_t pin, uint8_t channel){
+void setColor(uint8_t val, uint8_t channel){
     ledcWrite(channel, (val == 0) ? 256 : 255 - val);
 }
 
 void setColor(RGB color){
-    setColor(color.R, RED_PIN, RED_CHANNEL);
-    setColor(color.G, GREEN_PIN, GREEN_CHANNEL);
-    setColor(color.B, BLUE_PIN, BLUE_CHANNEL);
+    setColor(color.R, RED_CHANNEL);
+    setColor(color.G, GREEN_CHANNEL);
+    setColor(color.B, BLUE_CHANNEL);
+}
+
+void pulse(RGB color) {
+    //TODO
+}
+
+RGB calculatePulse() {
+    return {0, 0, 0};
+}
+
+RGB currentColor() {
+    if (pulseStart > 0) {
+        return calculatePulse();
+    }
+    switch(mode) {
+        case OFF:
+            return OFF_COLOR;
+        case NAP:
+            time_t now;
+            time(&now);
+            double duration;
+            duration = difftime(now, sleepStart);
+            if (duration/60 <= settings.napLength) {
+                return SLEEP_COLOR;
+            } else if (duration >= settings.napLength * 60 + AUTO_OFF_TIME_SECONDS) {
+                resetSleep();
+                return OFF_COLOR;
+            } else {
+                return OK_COLOR;
+            }
+            break;
+        case SLEEP:
+            struct tm timeinfo;
+            if (!getLocalTime(&timeinfo)){
+                log_e("Couldn't get time");
+                return OFF_COLOR;
+            }
+            //This assumes midnight is a sleeping time
+            if (isAfter(settings.napsBeforeTime, &timeinfo)) {
+                //This covers sleep time to midnight
+                return SLEEP_COLOR;
+            } else if (isBefore(settings.sleepWarnTime, &timeinfo)) {
+                return SLEEP_COLOR;
+            } else if (isAfter(settings.sleepWarnTime, &timeinfo) && isBefore(settings.sleepOKTime, &timeinfo)){
+                return WARN_COLOR;
+            } else if (isAfter(settings.sleepOKTime + AUTO_OFF_TIME_SECONDS / 60, &timeinfo)){
+                resetSleep();
+                return OFF_COLOR;
+            } else {
+                return OK_COLOR;
+            }
+    }
 }
 
 void startSleep() {
+    Serial.println("Mode" + modeToString(mode));
     if (mode != OFF) {
         return;
     }
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo)){
         log_e("Couldn't get local time, aborting");
-        //TODO: Flash red
+        pulse({50, 0, 0});
+        return;
     }
     if (isBefore(settings.napsBeforeTime, &timeinfo)){
         mode = NAP;
-        //set waketime.OK
+        sleepStart = mktime(&timeinfo)
+        Serial.println("Mode" + modeToString(mode));
+        pulse({40, 40, 0});
     } else {
         mode = SLEEP;
+        sleepStart = mktime(&timeinfo)
+        Serial.println("Mode" + modeToString(mode));
+        pulse({0, 0, 50});
     }
+}
+
+void resetSleep() {
+    Serial.println("Reset");
+    if (mode == OFF) {
+        return;
+    }
+    mode = OFF;
+}
+
+const int64_t DEBOUNCE_DELAY = 35;
+int64_t buttonDownSince = -1;
+bool buttonWasPressed = false;
+
+void handleButton() {
+    int64_t buttonDownFor = buttonDownSince >= 0 ? millis() - buttonDownSince : 0;
+    bool buttonReleased = false;
+    bool buttonPressed = false;
+    if (digitalRead(BUTTON_PIN) == HIGH) {
+        if (buttonDownSince < 0) {
+            buttonDownSince = millis();
+        } else if (buttonDownFor >= DEBOUNCE_DELAY) {
+            buttonPressed = true;
+        }
+    } else if (buttonDownFor >= DEBOUNCE_DELAY) {
+        // button up
+        buttonDownSince = -1;
+        buttonReleased = true;
+    }
+
+    if (buttonPressed && !buttonWasPressed) {
+        if (mode == OFF) {
+            startSleep();
+        } else {
+            resetSleep();
+        }
+    }
+
+    buttonWasPressed = buttonPressed;
 }
 
 
 void loop() {
     server.handleClient();
 
-    time(&this_second);
-    if (wakeTime.OK && this_second > wakeTime.OK) {
-        setColor(OK_COLOR);
-    } else if (wakeTime.warn && this_second > wakeTime.warn) {
-        setColor(WARN_COLOR);
-    } else if (wakeTime.warn || wakeTime.OK) {
-        setColor(SLEEP_COLOR);
-    } else {
-        setColor(OFF_COLOR);
-    }
-    //Don't need to be a space heater
-    delay(25);
+    handleButton();
+
+    setColor(currentColor());
 }
