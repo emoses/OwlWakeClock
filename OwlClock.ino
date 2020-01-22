@@ -33,14 +33,13 @@ uint16_t minuteOfDay(int hour, int minute) {
     return hour * 60 + minute;
 }
 
-String minuteToTimeStr(uint16_t minuteOfDay) {
+char* minuteToTimeStr(uint16_t minuteOfDay, char* result, size_t n) {
     struct tm t;
     t.tm_hour = (int)minuteOfDay / 60;
     t.tm_min = minuteOfDay % 60;
 
-    char buf[10];
-    strftime(buf, 9, "%I:%M %p", &t);
-    return String(buf);
+    strftime(result, n, "%I:%M %p", &t);
+    return result;
 }
 
 bool isBefore(uint16_t minuteOfDay, struct tm* timeinfo) {
@@ -137,7 +136,7 @@ void loadSettings() {
     }
 }
 
-String modeToString(enum Mode_t mode) {
+const char * modeToString(enum Mode_t mode) {
     switch (mode) {
         case OFF:
             return "Off";
@@ -150,22 +149,37 @@ String modeToString(enum Mode_t mode) {
     }
 }
 
-String colorToString(const RGB& color) {
+char * colorToString(const RGB& color, char* result, int num) {
     if (color == OFF_COLOR) {
-        return "Off";
+        return strncpy(result, "Off", num);
     } else if (color == SLEEP_COLOR) {
-        return "Sleepy Red";
+        return strncpy(result, "Sleepy Red", num);
     } else if (color == WARN_COLOR) {
-        return "Getting up yellow";
+        return strncpy(result, "Getting up yellow", num);
     } else if (color == OK_COLOR) {
-        return "Fine to wake green";
+        return strncpy(result, "Fine to wake green", num);
     } else {
-        char colorStr[20];
-        sprintf(colorStr, "(%d, %d, %d)", color.R, color.G, color.B);
-        return String(colorStr);
+        snprintf(result, num, "(%d, %d, %d)", color.R, color.G, color.B);
+        return result;
     }
 }
 
+const char* GET_ROOT_TPL = "<html><head><title>Hoo!</title></head>"
+        "<body><h1>Hoo!</h1><p>It's currently %s</p>"
+        "<h2>Mode: %s</h2>"
+        "<p>Current color: %s</p>"
+        "<h2>Settings</h2><div>Nap length: %d minutes<br/>"
+        "It's a nap if it starts before %s<br/>"
+        "It's warning if it's after %s<br/>"
+        "It's OK to get up after %s<br/>"
+        "Brighness (0 - 255): %d</div>"
+        "<form action=\"start\" method=\"post\">"
+        "<input type=\"submit\" value=\"Start (1 hour)\" />"
+        "</body></html>";
+
+const char* POST_START_TPL = "<html><head><title>Timer set</title></head>"
+            "<body><h1>OK!</h1><p>Timer set!</p><a href=\"/\">Back</a>"
+            "</body></html>";
 
 
 void setup() {
@@ -203,31 +217,44 @@ void setup() {
 
     server.on("/", HTTP_GET, [&]() {
             struct tm timeinfo;
-            String time;
+            const char* time;
             if (!getLocalTime(&timeinfo)) {
                 time = "Error";
+            } else {
+                time = asctime(&timeinfo);
             }
-            time = String(asctime(&timeinfo));
-            String content = "<html><head><title>Hoo!</title></head>";
-            content += "<body><h1>Hoo!</h1><p>It's currently " + time + "</p>";
-            content += "<h2>Mode: " + String(modeToString(mode)) + "</h2>";
-            content += "<p>Current color: " + colorToString(currentColor()) + "</p>";
-            content += "<h2>Settings</h2><div>Nap length: " + String(settings.napLength) + " minutes<br/>";
-            content += "It's a nap if it starts before " + minuteToTimeStr(settings.napsBeforeTime) + "<br/>";
-            content += "It's warning if it's after " + minuteToTimeStr(settings.sleepWarnTime) + "<br/>";
-            content += "It's OK to get up after " + minuteToTimeStr(settings.sleepOKTime) + "<br/>";
-            content += "Brighness (0 - 255): " + String(settings.brightness) + "</div>";
-            content += "<form action=\"start\" method=\"post\">"
-                    "<input type=\"submit\" value=\"Start (1 hour)\" />"
-                    "</body></html>";
+            char colorStr[32];
+            colorToString(currentColor(), colorStr, 32);
+
+            char napsBeforeStr[16];
+            minuteToTimeStr(settings.napsBeforeTime, napsBeforeStr, 16);
+
+            char sleepWarnStr[16];
+            minuteToTimeStr(settings.sleepWarnTime, sleepWarnStr, 16);
+
+            char sleepOKStr[16];
+            minuteToTimeStr(settings.sleepOKTime, sleepOKStr, 16);
+
+
+            size_t len = (strlen(GET_ROOT_TPL) + 300) * sizeof(char);
+            char* content = (char*)malloc(len);
+            snprintf(content, len, GET_ROOT_TPL,
+                     time,
+                     modeToString(mode),
+                     colorStr,
+                     settings.napLength,
+                     napsBeforeStr,
+                     sleepWarnStr,
+                     sleepOKStr,
+                     settings.brightness);
+
+
             server.send(200, "text/html", content);
+            free(content);
         });
     server.on("/start", HTTP_POST, [&]() {
             startSleep();
-            String content = "<html><head><title>Timer set</title></head>";
-            content += "<body><h1>OK!</h1><p>Timer set!</p><a href=\"/\">Back</a>";
-            content += "</body></html>";
-            server.send(200, "text/html", content);
+            server.send(200, "text/html", POST_START_TPL);
         });
 
 }
@@ -295,7 +322,8 @@ RGB currentColor() {
 }
 
 void startSleep() {
-    Serial.println("Mode" + modeToString(mode));
+    Serial.print("Mode: ");
+    Serial.println(modeToString(mode));
     if (mode != OFF) {
         return;
     }
@@ -305,15 +333,17 @@ void startSleep() {
         pulse({50, 0, 0});
         return;
     }
-    if (isBefore(settings.napsBeforeTime, &timeinfo)){
+    if (isBefore(settings.napsBeforeTime, &timeinfo) && isAfter(settings.sleepOKTime, &timeinfo)){
         mode = NAP;
-        sleepStart = mktime(&timeinfo)
-        Serial.println("Mode" + modeToString(mode));
+        sleepStart = mktime(&timeinfo);
+        Serial.print("Mode: ");
+        Serial.println(modeToString(mode));
         pulse({40, 40, 0});
     } else {
         mode = SLEEP;
-        sleepStart = mktime(&timeinfo)
-        Serial.println("Mode" + modeToString(mode));
+        sleepStart = mktime(&timeinfo);
+        Serial.print("Mode: ");
+        Serial.println(modeToString(mode));
         pulse({0, 0, 50});
     }
 }
