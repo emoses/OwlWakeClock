@@ -69,6 +69,7 @@ const HSV WARN_COLOR = {42, 200, 255};
 const HSV OK_COLOR = {85, 200, 255};
 
 const int AUTO_OFF_TIME_SECONDS = 60 * 60;
+const long pulseDuration = 1300;
 
 //Globals
 time_t sleepStart = 0;
@@ -182,7 +183,9 @@ char * colorToString(const HSV& color, char* result, int num) {
     }
 }
 
-const char* GET_ROOT_TPL = "<html><head><title>Hoo!</title></head>"
+const char* GET_ROOT_TPL = "<html><head>"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />"
+        "<title>Hoo!</title></head>"
         "<body><h1>Hoo!</h1><p>It's currently %s</p>"
         "<h2>Mode: %s</h2>"
         "<p>Current color: %s</p>"
@@ -202,15 +205,21 @@ const char* GET_ROOT_TPL = "<html><head><title>Hoo!</title></head>"
         "</form>"
         "</body></html>";
 
-const char* POST_START_TPL = "<html><head><title>Timer set</title></head>"
-            "<body><h1>OK!</h1><p>Timer set!</p><a href=\"/\">Back</a>"
-            "</body></html>";
+const char* POST_START_TPL = "<html><head>"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />"
+        "<title>Timer set</title></head>"
+        "<body><h1>OK!</h1><p>Timer set!</p><a href=\"/\">Back</a>"
+        "</body></html>";
 
-const char* UPDATED_TPL = "<html><head><title>Updated</title></head>"
+const char* UPDATED_TPL = "<html><head>"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />"
+        "<title>Updated</title></head>"
         "<body><h1>OK!</h1><p>Settings updated</p><a href=\"/\">Back</a>"
         "</body></html>";
 
-const char* UPDATED_ERR_TPL = "<html><head><title>Update Error</title></head>"
+const char* UPDATED_ERR_TPL = "<html><head>"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />"
+        "<title>Update Error</title></head>"
         "<body><h1>OK!</h1><p>Settings not updated: %s</p><a href=\"/\">Back</a>"
         "</body></html>";
 
@@ -338,12 +347,31 @@ void setColor(const HSV &color){
 }
 
 
-void pulse(const RGB &color) {
-    //TODO
+void pulse(const HSV &color) {
+    pulseStart = millis();
+    pulseColor = color;
+    //pulseColor.v = floor((float)pulseColor.v * settings.brightness/255.0);
+}
+
+double ease(double p) {
+    double f = 2*p - 1;
+    if(p < 0.5) {
+        return 1 - f*f*f*f;
+    } else {
+        return 1 - f*f;
+    }
 }
 
 HSV calculatePulse() {
-    return {0, 0, 0};
+    double duration = millis() - pulseStart;
+    if (duration > pulseDuration) {
+        pulseStart = 0;
+        return OFF_COLOR;
+    }
+    double p = (double)duration / (double)pulseDuration;
+    HSV curr = pulseColor;
+    curr.v = floor((double)curr.v * ease(p));
+    return curr;
 }
 
 HSV currentColor() {
@@ -403,7 +431,7 @@ void startSleep() {
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo)){
         log_e("Couldn't get local time, aborting");
-        pulse({50, 0, 0});
+        pulse({0, 255, 255});
         return;
     }
     if (isBefore(settings.napsBeforeTime, &timeinfo) && isAfter(settings.sleepOKTime, &timeinfo)){
@@ -411,13 +439,13 @@ void startSleep() {
         sleepStart = mktime(&timeinfo);
         Serial.print("Mode: ");
         Serial.println(modeToString(mode));
-        pulse({40, 40, 0});
+        pulse({42, 255, 255});
     } else {
         mode = SLEEP;
         sleepStart = mktime(&timeinfo);
         Serial.print("Mode: ");
         Serial.println(modeToString(mode));
-        pulse({0, 0, 50});
+        pulse({170, 255, 255});
     }
 }
 
