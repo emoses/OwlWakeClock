@@ -44,14 +44,16 @@ char* minuteToTimeStr(uint16_t minuteOfDay, char* result, size_t n) {
     return result;
 }
 
-bool isBefore(uint16_t minuteOfDay, struct tm* timeinfo) {
-    uint16_t minute = timeinfo->tm_hour * 60 + timeinfo->tm_min;
-    return minuteOfDay < minute;
+uint16_t timeToMinuteOfDay(const struct tm* timeinfo) {
+    return (uint16_t)timeinfo->tm_hour * 60 + (uint16_t)timeinfo->tm_min;
 }
 
-bool isAfter(uint16_t minuteOfDay, struct tm* timeinfo) {
-    uint16_t minute = timeinfo->tm_hour * 60 + timeinfo->tm_min;
-    return minuteOfDay > minute;
+bool isBefore(uint16_t minuteOfDay, const struct tm* timeinfo) {
+    return timeToMinuteOfDay(timeinfo) <= minuteOfDay ;
+}
+
+bool isAfter(uint16_t minuteOfDay, const struct tm* timeinfo) {
+    return timeToMinuteOfDay(timeinfo) > minuteOfDay;
 }
 
 
@@ -434,6 +436,7 @@ void startSleep() {
         pulse({0, 255, 255});
         return;
     }
+
     if (isBefore(settings.napsBeforeTime, &timeinfo) && isAfter(settings.sleepOKTime, &timeinfo)){
         mode = NAP;
         sleepStart = mktime(&timeinfo);
