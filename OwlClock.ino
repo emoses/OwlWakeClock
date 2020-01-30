@@ -6,6 +6,8 @@
 #include <WiFiClient.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include "color.h"
+#include <math.h>
 
 
 const char* MDNS_NAME = "owlclock";
@@ -61,17 +63,17 @@ const settings_t DEFAULT_SETTINGS = {
     30
 };
 
-const RGB OFF_COLOR = {0, 0, 0};
-const RGB SLEEP_COLOR = {30, 0, 0};
-const RGB WARN_COLOR = {30, 30, 0};
-const RGB OK_COLOR = {0, 30, 0};
+const HSV OFF_COLOR = {0, 0, 0};
+const HSV SLEEP_COLOR = {0, 200, 255};
+const HSV WARN_COLOR = {42, 200, 255};
+const HSV OK_COLOR = {85, 200, 255};
 
 const int AUTO_OFF_TIME_SECONDS = 60 * 60;
 
 //Globals
 time_t sleepStart = 0;
 long pulseStart = 0;
-RGB pulseColor;
+HSV pulseColor;
 settings_t settings = DEFAULT_SETTINGS;
 Mode_t mode = OFF;
 Preferences preferences;
@@ -110,30 +112,44 @@ void setupLedPins() {
     ledcAttachPin(BLUE_PIN, BLUE_CHANNEL);
 }
 
-void writeSettings() {
-    size_t result = preferences.putBytes("settings", &settings, sizeof(settings));
-    if (result != sizeof(settings)){
-        log_e("Error writing settings");
-    }
+bool writeSettings() {
+    preferences.begin("owlclock");
+    bool ret = _writeSettings();
+    preferences.end();
+    return ret;
 }
+
+bool _writeSettings() {
+    size_t result = preferences.putBytes("settings", &settings, sizeof(settings_t));
+    if (result != sizeof(settings_t)){
+        Serial.println(String("Error writing settings, only ") + result + " bytes written");
+        return false;
+    }
+    return true;
+}
+
 
 void loadSettings() {
     preferences.begin("owlclock");
     size_t settingsLen = preferences.getBytesLength("settings");
     if (settingsLen == 0){
+        Serial.println("Using default settings");
         settings = DEFAULT_SETTINGS;
-        writeSettings();
-    } else if (settingsLen != sizeof(settings)) {
+        _writeSettings();
+    } else if (settingsLen != sizeof(settings_t)) {
+        Serial.println("Clearing settings");
         preferences.remove("settings");
-        writeSettings();
+        settings = DEFAULT_SETTINGS;
+        _writeSettings();
     } else {
-        size_t result = preferences.getBytes("settings", &settings, sizeof(settings));
-        if (result != sizeof(settings)){
-            log_e("Error reading settings, resuming defaults");
+        size_t result = preferences.getBytes("settings", &settings, sizeof(settings_t));
+        if (result != sizeof(settings_t)){
+            Serial.println("Error reading settings, resuming defaults");
             settings = DEFAULT_SETTINGS;
-            writeSettings();
+            _writeSettings();
         }
     }
+    preferences.end();
 }
 
 const char * modeToString(enum Mode_t mode) {
@@ -149,7 +165,7 @@ const char * modeToString(enum Mode_t mode) {
     }
 }
 
-char * colorToString(const RGB& color, char* result, int num) {
+char * colorToString(const HSV& color, char* result, int num) {
     if (color == OFF_COLOR) {
         return strncpy(result, "Off", num);
     } else if (color == SLEEP_COLOR) {
@@ -159,7 +175,9 @@ char * colorToString(const RGB& color, char* result, int num) {
     } else if (color == OK_COLOR) {
         return strncpy(result, "Fine to wake green", num);
     } else {
-        snprintf(result, num, "(%d, %d, %d)", color.R, color.G, color.B);
+        RGB rgb_color;
+        color_HSV2RGB(&color, &rgb_color);
+        snprintf(result, num, "(%d, %d, %d)", rgb_color.r, rgb_color.g, rgb_color.b);
         return result;
     }
 }
@@ -172,14 +190,41 @@ const char* GET_ROOT_TPL = "<html><head><title>Hoo!</title></head>"
         "It's a nap if it starts before %s<br/>"
         "It's warning if it's after %s<br/>"
         "It's OK to get up after %s<br/>"
-        "Brighness (0 - 255): %d</div>"
-        "<form action=\"start\" method=\"post\">"
+        "Brightness (0 - 255): %d</div>"
+        "<form action=\"/start\" method=\"post\">"
         "<input type=\"submit\" value=\"Start (1 hour)\" />"
+        "</form>"
+        "<h3>Update settings:</h3>"
+        "<form action=\"/editSettings\" method=\"post\">"
+        "<label for=\"brightness\">Brightness</label> "
+        "<input type=\"number\" min=\"0\" max=\"255\" name=\"brightness\" id=\"brightness\" value=\"%d\"/>"
+        "<input type=\"submit\" value=\"Submit\" />"
+        "</form>"
         "</body></html>";
 
 const char* POST_START_TPL = "<html><head><title>Timer set</title></head>"
             "<body><h1>OK!</h1><p>Timer set!</p><a href=\"/\">Back</a>"
             "</body></html>";
+
+const char* UPDATED_TPL = "<html><head><title>Updated</title></head>"
+        "<body><h1>OK!</h1><p>Settings updated</p><a href=\"/\">Back</a>"
+        "</body></html>";
+
+const char* UPDATED_ERR_TPL = "<html><head><title>Update Error</title></head>"
+        "<body><h1>OK!</h1><p>Settings not updated: %s</p><a href=\"/\">Back</a>"
+        "</body></html>";
+
+void writeTpl(WebServer &server, int status, const char* tpl, ...) {
+    size_t len = (strlen(tpl) + 512);
+    char* content = (char*)calloc(len, sizeof(char));
+    va_list args;
+    va_start(args, tpl);
+    vsnprintf(content, len, tpl, args);
+
+    server.send(status, "text/html", content);
+    free(content);
+    va_end(args);
+}
 
 
 void setup() {
@@ -189,6 +234,7 @@ void setup() {
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     setupLedPins();
     setColor(OFF_COLOR);
+    loadSettings();
 
     wifiConnect();
     configTzTime(TZ_STR, "pool.ntp.org");
@@ -236,9 +282,7 @@ void setup() {
             minuteToTimeStr(settings.sleepOKTime, sleepOKStr, 16);
 
 
-            size_t len = (strlen(GET_ROOT_TPL) + 300) * sizeof(char);
-            char* content = (char*)malloc(len);
-            snprintf(content, len, GET_ROOT_TPL,
+            writeTpl(server, 200, GET_ROOT_TPL,
                      time,
                      modeToString(mode),
                      colorStr,
@@ -246,41 +290,67 @@ void setup() {
                      napsBeforeStr,
                      sleepWarnStr,
                      sleepOKStr,
+                     settings.brightness,
                      settings.brightness);
-
-
-            server.send(200, "text/html", content);
-            free(content);
         });
     server.on("/start", HTTP_POST, [&]() {
             startSleep();
             server.send(200, "text/html", POST_START_TPL);
         });
+    server.on("/editSettings", HTTP_POST, [&]() {
+            bool err = false;
+            char* msg;
+            if (server.hasArg("brightness")){
+                int bVal = server.arg("brightness").toInt();
+                if (bVal < 0 || bVal > 255) {
+                    err = true;
+                    msg = "Brightness out of range";
+                }
+                settings.brightness = bVal;
+                if (!writeSettings()) {
+                    err = true;
+                    msg = "Error updating settings";
+                }
+            }
 
+            if (err) {
+                writeTpl(server, 400, UPDATED_ERR_TPL, msg);
+            } else {
+                writeTpl(server, 200, UPDATED_TPL);
+            }
+        });
 }
 
 void setColor(uint8_t val, uint8_t channel){
     ledcWrite(channel, (val == 0) ? 256 : 255 - val);
 }
 
-void setColor(RGB color){
-    setColor(color.R, RED_CHANNEL);
-    setColor(color.G, GREEN_CHANNEL);
-    setColor(color.B, BLUE_CHANNEL);
+void setColor(const RGB &color){
+    setColor(color.r, RED_CHANNEL);
+    setColor(color.g, GREEN_CHANNEL);
+    setColor(color.b, BLUE_CHANNEL);
 }
 
-void pulse(RGB color) {
+void setColor(const HSV &color){
+    RGB rgb;
+    color_HSV2RGB(&color, &rgb);
+    setColor(rgb);
+}
+
+
+void pulse(const RGB &color) {
     //TODO
 }
 
-RGB calculatePulse() {
+HSV calculatePulse() {
     return {0, 0, 0};
 }
 
-RGB currentColor() {
+HSV currentColor() {
     if (pulseStart > 0) {
         return calculatePulse();
     }
+    HSV result;
     switch(mode) {
         case OFF:
             return OFF_COLOR;
@@ -290,35 +360,38 @@ RGB currentColor() {
             double duration;
             duration = difftime(now, sleepStart);
             if (duration/60 <= settings.napLength) {
-                return SLEEP_COLOR;
+                result = SLEEP_COLOR;
             } else if (duration >= settings.napLength * 60 + AUTO_OFF_TIME_SECONDS) {
                 resetSleep();
-                return OFF_COLOR;
+                result = OFF_COLOR;
             } else {
-                return OK_COLOR;
+                result = OK_COLOR;
             }
             break;
         case SLEEP:
             struct tm timeinfo;
             if (!getLocalTime(&timeinfo)){
                 log_e("Couldn't get time");
-                return OFF_COLOR;
-            }
-            //This assumes midnight is a sleeping time
-            if (isAfter(settings.napsBeforeTime, &timeinfo)) {
-                //This covers sleep time to midnight
-                return SLEEP_COLOR;
-            } else if (isBefore(settings.sleepWarnTime, &timeinfo)) {
-                return SLEEP_COLOR;
-            } else if (isAfter(settings.sleepWarnTime, &timeinfo) && isBefore(settings.sleepOKTime, &timeinfo)){
-                return WARN_COLOR;
-            } else if (isAfter(settings.sleepOKTime + AUTO_OFF_TIME_SECONDS / 60, &timeinfo)){
-                resetSleep();
-                return OFF_COLOR;
+                result = OFF_COLOR;
             } else {
-                return OK_COLOR;
+                //This assumes midnight is a sleeping time
+                if (isAfter(settings.napsBeforeTime, &timeinfo)) {
+                    //This covers sleep time to midnight
+                    result = SLEEP_COLOR;
+                } else if (isBefore(settings.sleepWarnTime, &timeinfo)) {
+                    result = SLEEP_COLOR;
+                } else if (isAfter(settings.sleepWarnTime, &timeinfo) && isBefore(settings.sleepOKTime, &timeinfo)){
+                    result = WARN_COLOR;
+                } else if (isAfter(settings.sleepOKTime + AUTO_OFF_TIME_SECONDS / 60, &timeinfo)){
+                    resetSleep();
+                    result = OFF_COLOR;
+                } else {
+                    result = OK_COLOR;
+                }
             }
     }
+    result.v = floor((float) result.v * ((float)settings.brightness)/255.0);
+    return result;
 }
 
 void startSleep() {
